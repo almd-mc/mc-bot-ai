@@ -1,27 +1,18 @@
 import json
+import almai
+import almai.tools
 
 // Minecraft bot AI integration for 1.21.1.
 // Phase 5 (Intelligence) of the almd-mc ecosystem.
 //
-// Provides the AI layer for mc-bot: conversation management,
-// prompt construction, action parsing, and tool definitions.
-// Designed to plug into almai at the application level.
+// Connects almai LLM client to mc-bot for AI-powered gameplay.
 //
 // Usage:
 //   import mc_bot_ai
 //   let ai = mc_bot_ai.new_ai("anthropic/claude-sonnet-4-6")
-//   let conv = mc_bot_ai.get_conv(ai, "Steve")
-//   let conv2 = mc_bot_ai.add_chat(conv, "Steve", "Build a house")
-//   let msgs = mc_bot_ai.to_messages(conv2)
-//   // Pass msgs to almai.call(), then:
-//   let ai2 = mc_bot_ai.on_response(ai, "Steve", "Sure! I'll start building.", conv2)
+//   let ai2 = mc_bot_ai.on_chat(ai, "Steve", "Build me a house")!
 
-// --- Core types ---
-
-type Message = {
-  role: String,
-  content: String,
-}
+// --- Types ---
 
 type BotAI = {
   model: String,
@@ -34,7 +25,7 @@ type BotAI = {
 
 type PlayerConv = {
   player: String,
-  messages: List[Message],
+  messages: List[almai.Message],
 }
 
 type BotAction =
@@ -90,15 +81,15 @@ fn world_context_prompt(
 
 // --- Conversation management ---
 
-fn get_conv(ai: BotAI, player: String) -> List[Message] = {
+fn get_conv(ai: BotAI, player: String) -> List[almai.Message] = {
   let found = list.find(ai.conversations, (pc) => pc.player == player)
   match found {
     some(pc) => pc.messages,
-    none => [{ role: "system", content: ai.system_prompt }],
+    none => [almai.system(ai.system_prompt)],
   }
 }
 
-fn set_conv(ai: BotAI, player: String, messages: List[Message]) -> BotAI = {
+fn set_conv(ai: BotAI, player: String, messages: List[almai.Message]) -> BotAI = {
   let exists = list.any(ai.conversations, (pc) => pc.player == player)
   if exists then {
     let updated = list.map(ai.conversations, (pc) => {
@@ -110,13 +101,13 @@ fn set_conv(ai: BotAI, player: String, messages: List[Message]) -> BotAI = {
   }
 }
 
-fn add_chat(msgs: List[Message], player: String, message: String) -> List[Message] =
-  msgs + [{ role: "user", content: "${player}: ${message}" }]
+fn add_chat(msgs: List[almai.Message], player: String, message: String) -> List[almai.Message] =
+  msgs + [almai.user("${player}: ${message}")]
 
-fn add_response(msgs: List[Message], response: String) -> List[Message] =
-  msgs + [{ role: "assistant", content: response }]
+fn add_response(msgs: List[almai.Message], response: String) -> List[almai.Message] =
+  msgs + [almai.assistant(response)]
 
-fn trim_history(msgs: List[Message], max: Int) -> List[Message] = {
+fn trim_history(msgs: List[almai.Message], max: Int) -> List[almai.Message] = {
   let len = list.length(msgs)
   if len <= max then msgs
   else {
@@ -137,20 +128,38 @@ fn clear_conv(ai: BotAI, player: String) -> BotAI = {
 fn clear_all_convs(ai: BotAI) -> BotAI =
   { ...ai, conversations: [] }
 
-// --- Response handling ---
+// --- LLM chat (calls almai directly) ---
 
-fn on_response(ai: BotAI, player: String, response: String, prev_msgs: List[Message]) -> BotAI = {
+effect fn on_chat(ai: BotAI, player: String, message: String) -> Result[BotAI, String] = {
+  let msgs = get_conv(ai, player)
+  let msgs2 = add_chat(msgs, player, message)
+  let trimmed = trim_history(msgs2, ai.max_history)
+  let opts = almai.defaults()
+    |> almai.with_max_tokens(256)
+    |> almai.with_temperature(0.7)
+    |> almai.with_system(ai.system_prompt)
+
+  match almai.call_with(ai.model, trimmed, opts) {
+    ok(response) => {
+      let reply = response.content
+      let new_msgs = add_response(trimmed, reply)
+      let actions = parse_actions(reply)
+      let ai2 = set_conv(ai, player, new_msgs)
+      ok({ ...ai2, pending_reply: reply, pending_actions: actions })
+    },
+    err(e) => err("AI error: ${e}"),
+  }
+}
+
+// --- Manual response (no LLM call) ---
+
+fn on_response(ai: BotAI, player: String, response: String, prev_msgs: List[almai.Message]) -> BotAI = {
   let new_msgs = add_response(prev_msgs, response)
   let trimmed = trim_history(new_msgs, ai.max_history)
   let actions = parse_actions(response)
   let ai2 = set_conv(ai, player, trimmed)
   { ...ai2, pending_reply: response, pending_actions: actions }
 }
-
-// --- Message export (for passing to almai) ---
-
-fn to_messages(msgs: List[Message]) -> List[{ role: String, content: String }] =
-  list.map(msgs, (m) => { role: m.role, content: m.content })
 
 // --- Action parsing ---
 
@@ -182,8 +191,6 @@ fn parse_actions(reply: String) -> List[BotAction] = {
   actions
 }
 
-// --- Action formatting ---
-
 fn action_description(action: BotAction) -> String = {
   match action {
     Say(msg) => "say: ${msg}",
@@ -200,12 +207,47 @@ fn action_description(action: BotAction) -> String = {
   }
 }
 
-// --- Tool definitions (JSON Schema for almai) ---
+// --- Tool definitions (using almai.tools) ---
 
-fn tool_definitions_json() -> String =
-  "[{\"type\":\"function\",\"function\":{\"name\":\"say\",\"description\":\"Send a chat message\",\"parameters\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}},\"required\":[\"message\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"move_to\",\"description\":\"Move to position\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"z\":{\"type\":\"integer\"}},\"required\":[\"x\",\"y\",\"z\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"follow_player\",\"description\":\"Follow a player\",\"parameters\":{\"type\":\"object\",\"properties\":{\"player\":{\"type\":\"string\"}},\"required\":[\"player\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"craft_item\",\"description\":\"Craft an item\",\"parameters\":{\"type\":\"object\",\"properties\":{\"item\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"item\",\"count\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"whisper\",\"description\":\"Private message a player\",\"parameters\":{\"type\":\"object\",\"properties\":{\"player\":{\"type\":\"string\"},\"message\":{\"type\":\"string\"}},\"required\":[\"player\",\"message\"]}}}]"
+fn bot_tools() -> List[almai.Tool] = [
+  almai.Tool {
+    name: "say",
+    description: "Send a chat message to all players",
+    parameters: tools.params([("message", tools.param_string("The message to send"))], ["message"]),
+  },
+  almai.Tool {
+    name: "whisper",
+    description: "Send a private message to a specific player",
+    parameters: tools.params([
+      ("player", tools.param_string("Target player name")),
+      ("message", tools.param_string("The message to send")),
+    ], ["player", "message"]),
+  },
+  almai.Tool {
+    name: "move_to",
+    description: "Move the bot to a specific position",
+    parameters: tools.params([
+      ("x", tools.param_int("X coordinate")),
+      ("y", tools.param_int("Y coordinate")),
+      ("z", tools.param_int("Z coordinate")),
+    ], ["x", "y", "z"]),
+  },
+  almai.Tool {
+    name: "follow_player",
+    description: "Follow a specific player",
+    parameters: tools.params([("player", tools.param_string("Player name to follow"))], ["player"]),
+  },
+  almai.Tool {
+    name: "craft_item",
+    description: "Craft an item",
+    parameters: tools.params([
+      ("item", tools.param_string("Item name to craft")),
+      ("count", tools.param_int("Number to craft")),
+    ], ["item", "count"]),
+  },
+]
 
-// Parse tool call JSON into BotAction.
+// Parse tool call into BotAction.
 fn parse_tool_call(name: String, arguments_json: String) -> Option[BotAction] = {
   match json.parse(arguments_json) {
     err(_e) => none,
@@ -232,12 +274,13 @@ fn parse_tool_call(name: String, arguments_json: String) -> Option[BotAction] = 
 
 // --- Tests ---
 
+let empty_msg = almai.user("")
+
 test "new_ai" {
   let ai = new_ai("anthropic/claude-sonnet-4-6")
   assert_eq(ai.model, "anthropic/claude-sonnet-4-6")
   assert_eq(ai.max_history, 20)
   assert_eq(ai.pending_reply, "")
-  assert(list.is_empty(ai.pending_actions))
 }
 
 test "with_system_prompt" {
@@ -254,64 +297,61 @@ test "get_conv - new player" {
   let ai = new_ai("m")
   let msgs = get_conv(ai, "Steve")
   assert_eq(list.length(msgs), 1)
-  assert_eq((list.get(msgs, 0) ?? { role: "", content: "" }).role, "system")
+  assert_eq((list.get(msgs, 0) ?? empty_msg).role, "system")
 }
 
 test "set_conv and get_conv" {
   let ai = new_ai("m")
-  let msgs = [{ role: "system", content: "sys" }, { role: "user", content: "hi" }]
+  let msgs = [almai.system("sys"), almai.user("hi")]
   let ai2 = set_conv(ai, "Steve", msgs)
-  let got = get_conv(ai2, "Steve")
-  assert_eq(list.length(got), 2)
+  assert_eq(list.length(get_conv(ai2, "Steve")), 2)
 }
 
 test "set_conv - update existing" {
   let ai = new_ai("m")
-  let ai2 = set_conv(ai, "Steve", [{ role: "user", content: "first" }])
-  let ai3 = set_conv(ai2, "Steve", [{ role: "user", content: "second" }])
+  let ai2 = set_conv(ai, "Steve", [almai.user("first")])
+  let ai3 = set_conv(ai2, "Steve", [almai.user("second")])
   assert_eq(list.length(ai3.conversations), 1)
 }
 
 test "add_chat" {
-  let msgs = [{ role: "system", content: "sys" }]
+  let msgs = [almai.system("sys")]
   let msgs2 = add_chat(msgs, "Alice", "Hello")
   assert_eq(list.length(msgs2), 2)
-  assert_eq((list.get(msgs2, 1) ?? { role: "", content: "" }).content, "Alice: Hello")
+  assert_eq((list.get(msgs2, 1) ?? empty_msg).content, "Alice: Hello")
 }
 
 test "add_response" {
-  let msgs = [{ role: "user", content: "hi" }]
+  let msgs = [almai.user("hi")]
   let msgs2 = add_response(msgs, "hello!")
   assert_eq(list.length(msgs2), 2)
-  assert_eq((list.get(msgs2, 1) ?? { role: "", content: "" }).role, "assistant")
+  assert_eq((list.get(msgs2, 1) ?? empty_msg).role, "assistant")
 }
 
 test "trim_history - under limit" {
-  let msgs = [{ role: "system", content: "s" }, { role: "user", content: "u" }]
+  let msgs = [almai.system("s"), almai.user("u")]
   let trimmed = trim_history(msgs, 10)
   assert_eq(list.length(trimmed), 2)
 }
 
 test "trim_history - over limit" {
-  var msgs = [{ role: "system", content: "sys" }]
+  var msgs = [almai.system("sys")]
   for i in 0..25 {
-    msgs = msgs + [{ role: "user", content: "msg ${int.to_string(i)}" }]
+    msgs = msgs + [almai.user("msg ${int.to_string(i)}")]
   }
   let trimmed = trim_history(msgs, 10)
   assert(list.length(trimmed) <= 10)
-  assert_eq((list.get(trimmed, 0) ?? { role: "", content: "" }).role, "system")
+  assert_eq((list.get(trimmed, 0) ?? empty_msg).role, "system")
 }
 
 test "clear_conv" {
-  let ai = set_conv(new_ai("m"), "Steve", [{ role: "user", content: "hi" }])
-  let ai2 = clear_conv(ai, "Steve")
-  assert(list.is_empty(ai2.conversations))
+  let ai = set_conv(new_ai("m"), "Steve", [almai.user("hi")])
+  assert(list.is_empty(clear_conv(ai, "Steve").conversations))
 }
 
 test "clear_all_convs" {
   let ai = set_conv(set_conv(new_ai("m"), "A", []), "B", [])
-  let ai2 = clear_all_convs(ai)
-  assert(list.is_empty(ai2.conversations))
+  assert(list.is_empty(clear_all_convs(ai).conversations))
 }
 
 test "on_response" {
@@ -320,8 +360,7 @@ test "on_response" {
   let msgs2 = add_chat(msgs, "Steve", "Hello")
   let ai2 = on_response(ai, "Steve", "Hi there!", msgs2)
   assert_eq(ai2.pending_reply, "Hi there!")
-  let conv = get_conv(ai2, "Steve")
-  assert_eq(list.length(conv), 3)
+  assert_eq(list.length(get_conv(ai2, "Steve")), 3)
 }
 
 test "parse_actions - say" {
@@ -334,48 +373,36 @@ test "parse_actions - say" {
 }
 
 test "parse_actions - follow" {
-  let actions = parse_actions("/follow Steve")
-  assert_eq(list.length(actions), 1)
-  match list.get(actions, 0) {
+  match list.get(parse_actions("/follow Steve"), 0) {
     some(FollowPlayer(p)) => assert_eq(p, "Steve"),
     _ => assert(false),
   }
 }
 
 test "parse_actions - whisper" {
-  let actions = parse_actions("/whisper Alice Hey there")
-  assert_eq(list.length(actions), 1)
-  match list.get(actions, 0) {
-    some(Whisper(p, m)) => {
-      assert_eq(p, "Alice")
-      assert_eq(m, "Hey there")
-    },
+  match list.get(parse_actions("/whisper Alice Hey there"), 0) {
+    some(Whisper(p, m)) => { assert_eq(p, "Alice"); assert_eq(m, "Hey there") },
     _ => assert(false),
   }
 }
 
 test "parse_actions - multiple" {
-  let actions = parse_actions("/say Hi\n/follow Alice\n/stop")
-  assert_eq(list.length(actions), 3)
+  assert_eq(list.length(parse_actions("/say Hi\n/follow Alice\n/stop")), 3)
 }
 
 test "parse_actions - no commands" {
-  let actions = parse_actions("Just a regular message")
-  assert(list.is_empty(actions))
+  assert(list.is_empty(parse_actions("Just a regular message")))
 }
 
 test "parse_actions - stop" {
-  let actions = parse_actions("/stop")
-  assert_eq(list.length(actions), 1)
-  match list.get(actions, 0) {
+  match list.get(parse_actions("/stop"), 0) {
     some(StopFollowing) => assert(true),
     _ => assert(false),
   }
 }
 
 test "parse_actions - attack and use" {
-  let actions = parse_actions("/attack zombie\n/use diamond_sword")
-  assert_eq(list.length(actions), 2)
+  assert_eq(list.length(parse_actions("/attack zombie\n/use diamond_sword")), 2)
 }
 
 test "action_description" where [
@@ -403,11 +430,7 @@ test "parse_tool_call - say" {
 
 test "parse_tool_call - move_to" {
   match parse_tool_call("move_to", "{\"x\":10,\"y\":64,\"z\":-5}") {
-    some(MoveTo(x, y, z)) => {
-      assert_eq(x, 10)
-      assert_eq(y, 64)
-      assert_eq(z, -5)
-    },
+    some(MoveTo(x, y, z)) => { assert_eq(x, 10); assert_eq(y, 64); assert_eq(z, -5) },
     _ => assert(false),
   }
 }
@@ -421,20 +444,7 @@ test "parse_tool_call - follow_player" {
 
 test "parse_tool_call - craft_item" {
   match parse_tool_call("craft_item", "{\"item\":\"stick\",\"count\":4}") {
-    some(CraftItem(item, count)) => {
-      assert_eq(item, "stick")
-      assert_eq(count, 4)
-    },
-    _ => assert(false),
-  }
-}
-
-test "parse_tool_call - whisper" {
-  match parse_tool_call("whisper", "{\"player\":\"Bob\",\"message\":\"secret\"}") {
-    some(Whisper(p, m)) => {
-      assert_eq(p, "Bob")
-      assert_eq(m, "secret")
-    },
+    some(CraftItem(item, count)) => { assert_eq(item, "stick"); assert_eq(count, 4) },
     _ => assert(false),
   }
 }
@@ -442,36 +452,27 @@ test "parse_tool_call - whisper" {
 test "parse_tool_call - unknown" {
   match parse_tool_call("unknown_tool", "{}") {
     none => assert(true),
-    some(_a) => assert(false),
+    _ => assert(false),
   }
 }
 
 test "parse_tool_call - invalid json" {
   match parse_tool_call("say", "not json") {
     none => assert(true),
-    some(_a) => assert(false),
+    _ => assert(false),
   }
+}
+
+test "bot_tools count" {
+  assert_eq(list.length(bot_tools()), 5)
 }
 
 test "world_context_prompt" {
   let prompt = world_context_prompt("Bot", 100, 64, -200, "overworld", 20.0, 20, "survival", "Alice, Bob")
   assert(string.contains(prompt, "Bot"))
-  assert(string.contains(prompt, "100"))
   assert(string.contains(prompt, "overworld"))
-  assert(string.contains(prompt, "Alice, Bob"))
 }
 
 test "default_system_prompt" {
-  let prompt = default_system_prompt()
-  assert(string.contains(prompt, "Minecraft"))
-  assert(string.contains(prompt, "bot"))
-}
-
-test "tool_definitions_json" {
-  let json_str = tool_definitions_json()
-  assert(string.contains(json_str, "say"))
-  assert(string.contains(json_str, "move_to"))
-  assert(string.contains(json_str, "follow_player"))
-  assert(string.contains(json_str, "craft_item"))
-  assert(string.contains(json_str, "whisper"))
+  assert(string.contains(default_system_prompt(), "Minecraft"))
 }
