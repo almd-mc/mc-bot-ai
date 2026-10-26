@@ -252,20 +252,20 @@ fn parse_tool_call(name: String, arguments_json: String) -> Option[BotAction] = 
   match json.parse(arguments_json) {
     err(_e) => none,
     ok(args) => match name {
-      "say" => some(Say(json.get_string(args, "message") |> option.unwrap_or(""))),
+      "say" => some(Say(value.get_string(args, "message") |> option.unwrap_or(""))),
       "whisper" => some(Whisper(
-        json.get_string(args, "player") |> option.unwrap_or(""),
-        json.get_string(args, "message") |> option.unwrap_or(""),
+        value.get_string(args, "player") |> option.unwrap_or(""),
+        value.get_string(args, "message") |> option.unwrap_or(""),
       )),
       "move_to" => some(MoveTo(
-        json.get_int(args, "x") |> option.unwrap_or(0),
-        json.get_int(args, "y") |> option.unwrap_or(0),
-        json.get_int(args, "z") |> option.unwrap_or(0),
+        value.get_int(args, "x") |> option.unwrap_or(0),
+        value.get_int(args, "y") |> option.unwrap_or(0),
+        value.get_int(args, "z") |> option.unwrap_or(0),
       )),
-      "follow_player" => some(FollowPlayer(json.get_string(args, "player") |> option.unwrap_or(""))),
+      "follow_player" => some(FollowPlayer(value.get_string(args, "player") |> option.unwrap_or(""))),
       "craft_item" => some(CraftItem(
-        json.get_string(args, "item") |> option.unwrap_or(""),
-        json.get_int(args, "count") |> option.unwrap_or(1),
+        value.get_string(args, "item") |> option.unwrap_or(""),
+        value.get_int(args, "count") |> option.unwrap_or(1),
       )),
       _ => none,
     },
