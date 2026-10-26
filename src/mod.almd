@@ -336,7 +336,7 @@ test "trim_history - under limit" {
 
 test "trim_history - over limit" {
   var msgs = [almai.system("sys")]
-  for i in 0..25 {
+  for i in 0..<25 {
     msgs = msgs + [almai.user("msg ${int.to_string(i)}")]
   }
   let trimmed = trim_history(msgs, 10)
